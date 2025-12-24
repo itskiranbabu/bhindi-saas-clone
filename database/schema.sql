@@ -3,7 +3,7 @@
 -- ============================================================================
 -- Database: PostgreSQL 15+
 -- Purpose: Production-ready schema for Supabase deployment
--- Note: This file can be executed directly in Supabase SQL Editor
+-- Note: This file can be executed multiple times safely (idempotent)
 -- ============================================================================
 
 -- Enable required extensions
@@ -336,7 +336,17 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
--- Apply trigger to tables with updated_at column
+-- Drop existing triggers if they exist (for idempotency)
+DROP TRIGGER IF EXISTS update_users_updated_at ON users;
+DROP TRIGGER IF EXISTS update_workspaces_updated_at ON workspaces;
+DROP TRIGGER IF EXISTS update_subscriptions_updated_at ON subscriptions;
+DROP TRIGGER IF EXISTS update_usage_quotas_updated_at ON usage_quotas;
+DROP TRIGGER IF EXISTS update_conversations_updated_at ON conversations;
+DROP TRIGGER IF EXISTS update_agents_updated_at ON agents;
+DROP TRIGGER IF EXISTS update_tools_updated_at ON tools;
+DROP TRIGGER IF EXISTS update_workflows_updated_at ON workflows;
+
+-- Create triggers
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
@@ -365,21 +375,39 @@ CREATE TRIGGER update_workflows_updated_at BEFORE UPDATE ON workflows
 -- SEED DATA (Optional - for testing)
 -- ============================================================================
 
--- Insert default system agents
-INSERT INTO agents (name, description, type, is_system, is_active) VALUES
-    ('Research Agent', 'Web search and research capabilities', 'research', true, true),
-    ('Code Agent', 'Programming and code assistance', 'code', true, true),
-    ('Data Agent', 'Data analysis and visualization', 'data', true, true),
-    ('Writing Agent', 'Content creation and writing', 'writing', true, true)
-ON CONFLICT DO NOTHING;
+-- Insert default system agents (only if they don't exist)
+INSERT INTO agents (name, description, type, is_system, is_active)
+SELECT 'Research Agent', 'Web search and research capabilities', 'research', true, true
+WHERE NOT EXISTS (SELECT 1 FROM agents WHERE name = 'Research Agent' AND is_system = true);
 
--- Insert default tools
-INSERT INTO tools (name, category, description, is_active) VALUES
-    ('Web Search', 'search', 'Search the web for information', true),
-    ('Calculator', 'math', 'Perform mathematical calculations', true),
-    ('Code Executor', 'development', 'Execute code snippets', true),
-    ('File Reader', 'files', 'Read file contents', true)
-ON CONFLICT DO NOTHING;
+INSERT INTO agents (name, description, type, is_system, is_active)
+SELECT 'Code Agent', 'Programming and code assistance', 'code', true, true
+WHERE NOT EXISTS (SELECT 1 FROM agents WHERE name = 'Code Agent' AND is_system = true);
+
+INSERT INTO agents (name, description, type, is_system, is_active)
+SELECT 'Data Agent', 'Data analysis and visualization', 'data', true, true
+WHERE NOT EXISTS (SELECT 1 FROM agents WHERE name = 'Data Agent' AND is_system = true);
+
+INSERT INTO agents (name, description, type, is_system, is_active)
+SELECT 'Writing Agent', 'Content creation and writing', 'writing', true, true
+WHERE NOT EXISTS (SELECT 1 FROM agents WHERE name = 'Writing Agent' AND is_system = true);
+
+-- Insert default tools (only if they don't exist)
+INSERT INTO tools (name, category, description, is_active)
+SELECT 'Web Search', 'search', 'Search the web for information', true
+WHERE NOT EXISTS (SELECT 1 FROM tools WHERE name = 'Web Search');
+
+INSERT INTO tools (name, category, description, is_active)
+SELECT 'Calculator', 'math', 'Perform mathematical calculations', true
+WHERE NOT EXISTS (SELECT 1 FROM tools WHERE name = 'Calculator');
+
+INSERT INTO tools (name, category, description, is_active)
+SELECT 'Code Executor', 'development', 'Execute code snippets', true
+WHERE NOT EXISTS (SELECT 1 FROM tools WHERE name = 'Code Executor');
+
+INSERT INTO tools (name, category, description, is_active)
+SELECT 'File Reader', 'files', 'Read file contents', true
+WHERE NOT EXISTS (SELECT 1 FROM tools WHERE name = 'File Reader');
 
 -- ============================================================================
 -- COMMENTS FOR DOCUMENTATION
@@ -407,5 +435,5 @@ COMMENT ON TABLE api_keys IS 'API keys for programmatic access';
 -- Total Tables: 14
 -- Total Indexes: 40+
 -- Total Triggers: 8
--- Status: Production Ready
+-- Status: Production Ready & Idempotent (can be run multiple times safely)
 -- ============================================================================
