@@ -1,243 +1,281 @@
 import { Router, Request, Response } from 'express';
-import { body, validationResult } from 'express-validator';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import { query } from '../database/connection';
-import { AppError, asyncHandler } from '../middleware/error.middleware';
-import { authRateLimiter } from '../middleware/rateLimit.middleware';
-import { logger } from '../utils/logger';
+import { authService } from '../services/auth.service';
 
 const router = Router();
 
-// Validation rules
-const registerValidation = [
-  body('email').isEmail().normalizeEmail(),
-  body('password').isLength({ min: 8 }),
-  body('fullName').trim().notEmpty(),
-];
-
-const loginValidation = [
-  body('email').isEmail().normalizeEmail(),
-  body('password').notEmpty(),
-];
-
-// Register
-router.post(
-  '/register',
-  authRateLimiter,
-  registerValidation,
-  asyncHandler(async (req: Request, res: Response) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      throw new AppError('Validation failed', 400);
-    }
-
+/**
+ * Register a new user
+ * POST /api/auth/register
+ */
+router.post('/register', async (req: Request, res: Response) => {
+  try {
     const { email, password, fullName } = req.body;
 
-    // Check if user exists
-    const existingUser = await query(
-      'SELECT id FROM users WHERE email = $1',
-      [email]
-    );
-
-    if (existingUser.rows.length > 0) {
-      throw new AppError('Email already registered', 409);
+    // Validation
+    if (!email || !password || !fullName) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email, password, and full name are required',
+      });
     }
 
-    // Hash password
-    const passwordHash = await bcrypt.hash(password, 12);
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 8 characters long',
+      });
+    }
 
-    // Create user
-    const result = await query(
-      `INSERT INTO users (email, password_hash, full_name, status)
-       VALUES ($1, $2, $3, 'active')
-       RETURNING id, email, full_name, created_at`,
-      [email, passwordHash, fullName]
-    );
-
-    const user = result.rows[0];
-
-    // Create default workspace
-    const workspaceResult = await query(
-      `INSERT INTO workspaces (name, slug, owner_id, plan_type)
-       VALUES ($1, $2, $3, 'free')
-       RETURNING id`,
-      [`${fullName}'s Workspace`, `${user.id}-workspace`, user.id]
-    );
-
-    const workspaceId = workspaceResult.rows[0].id;
-
-    // Add user to workspace
-    await query(
-      `INSERT INTO workspace_members (workspace_id, user_id, role)
-       VALUES ($1, $2, 'owner')`,
-      [workspaceId, user.id]
-    );
-
-    // Generate JWT
-    const token = jwt.sign(
-      {
-        userId: user.id,
-        email: user.email,
-        workspaceId,
-        role: 'owner',
-      },
-      process.env.JWT_SECRET!,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-    );
-
-    logger.info('User registered', { userId: user.id, email: user.email });
+    // Register user
+    const result = await authService.register(email, password, fullName);
 
     res.status(201).json({
       success: true,
+      message: 'User registered successfully',
       data: {
-        user: {
-          id: user.id,
-          email: user.email,
-          fullName: user.full_name,
-          workspaceId,
-        },
-        token,
+        user: result.user,
+        token: result.tokens.accessToken,
+        refreshToken: result.tokens.refreshToken,
       },
     });
-  })
-);
+  } catch (error: any) {
+    console.error('Registration error:', error);
+    res.status(400).json({
+      success: false,
+      message: error.message || 'Registration failed',
+    });
+  }
+});
 
-// Login
-router.post(
-  '/login',
-  authRateLimiter,
-  loginValidation,
-  asyncHandler(async (req: Request, res: Response) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      throw new AppError('Validation failed', 400);
-    }
-
+/**
+ * Login user
+ * POST /api/auth/login
+ */
+router.post('/login', async (req: Request, res: Response) => {
+  try {
     const { email, password } = req.body;
 
-    // Get user
-    const result = await query(
-      `SELECT u.id, u.email, u.password_hash, u.full_name, u.status,
-              wm.workspace_id, wm.role
-       FROM users u
-       LEFT JOIN workspace_members wm ON u.id = wm.user_id
-       WHERE u.email = $1 AND u.deleted_at IS NULL
-       LIMIT 1`,
-      [email]
-    );
-
-    if (result.rows.length === 0) {
-      throw new AppError('Invalid credentials', 401);
+    // Validation
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email and password are required',
+      });
     }
 
-    const user = result.rows[0];
+    // Login user
+    const result = await authService.login(email, password);
 
-    if (user.status !== 'active') {
-      throw new AppError('Account is not active', 403);
-    }
-
-    // Verify password
-    const isValidPassword = await bcrypt.compare(password, user.password_hash);
-    if (!isValidPassword) {
-      throw new AppError('Invalid credentials', 401);
-    }
-
-    // Update last login
-    await query(
-      'UPDATE users SET last_login_at = NOW() WHERE id = $1',
-      [user.id]
-    );
-
-    // Generate JWT
-    const token = jwt.sign(
-      {
-        userId: user.id,
-        email: user.email,
-        workspaceId: user.workspace_id,
-        role: user.role,
+    res.json({
+      success: true,
+      message: 'Login successful',
+      data: {
+        user: result.user,
+        token: result.tokens.accessToken,
+        refreshToken: result.tokens.refreshToken,
       },
-      process.env.JWT_SECRET!,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-    );
+    });
+  } catch (error: any) {
+    console.error('Login error:', error);
+    res.status(401).json({
+      success: false,
+      message: error.message || 'Login failed',
+    });
+  }
+});
 
-    logger.info('User logged in', { userId: user.id, email: user.email });
+/**
+ * Verify token
+ * GET /api/auth/verify
+ */
+router.get('/verify', async (req: Request, res: Response) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: 'No token provided',
+      });
+    }
+
+    const user = await authService.verifyToken(token);
+
+    res.json({
+      success: true,
+      data: { user },
+    });
+  } catch (error: any) {
+    console.error('Token verification error:', error);
+    res.status(401).json({
+      success: false,
+      message: error.message || 'Invalid token',
+    });
+  }
+});
+
+/**
+ * Refresh access token
+ * POST /api/auth/refresh
+ */
+router.post('/refresh', async (req: Request, res: Response) => {
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      return res.status(400).json({
+        success: false,
+        message: 'Refresh token is required',
+      });
+    }
+
+    const tokens = await authService.refreshAccessToken(refreshToken);
 
     res.json({
       success: true,
       data: {
-        user: {
-          id: user.id,
-          email: user.email,
-          fullName: user.full_name,
-          workspaceId: user.workspace_id,
-          role: user.role,
-        },
-        token,
+        token: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
       },
     });
-  })
-);
+  } catch (error: any) {
+    console.error('Token refresh error:', error);
+    res.status(401).json({
+      success: false,
+      message: error.message || 'Token refresh failed',
+    });
+  }
+});
 
-// Verify token
-router.get(
-  '/verify',
-  asyncHandler(async (req: Request, res: Response) => {
-    const authHeader = req.headers.authorization;
+/**
+ * Change password
+ * POST /api/auth/change-password
+ */
+router.post('/change-password', async (req: Request, res: Response) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      throw new AppError('No token provided', 401);
-    }
-
-    const token = authHeader.substring(7);
-
-    try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET!) as any;
-
-      // Get fresh user data
-      const result = await query(
-        `SELECT u.id, u.email, u.full_name, u.status,
-                wm.workspace_id, wm.role
-         FROM users u
-         LEFT JOIN workspace_members wm ON u.id = wm.user_id
-         WHERE u.id = $1 AND u.deleted_at IS NULL`,
-        [decoded.userId]
-      );
-
-      if (result.rows.length === 0) {
-        throw new AppError('User not found', 404);
-      }
-
-      const user = result.rows[0];
-
-      res.json({
-        success: true,
-        data: {
-          user: {
-            id: user.id,
-            email: user.email,
-            fullName: user.full_name,
-            workspaceId: user.workspace_id,
-            role: user.role,
-          },
-        },
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
       });
-    } catch (error) {
-      throw new AppError('Invalid token', 401);
     }
-  })
-);
 
-// Logout (client-side token removal, but we can log it)
-router.post(
-  '/logout',
-  asyncHandler(async (req: Request, res: Response) => {
-    logger.info('User logged out');
+    const user = await authService.verifyToken(token);
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Current password and new password are required',
+      });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'New password must be at least 8 characters long',
+      });
+    }
+
+    await authService.changePassword(user.id, currentPassword, newPassword);
+
     res.json({
       success: true,
-      message: 'Logged out successfully',
+      message: 'Password changed successfully',
     });
-  })
-);
+  } catch (error: any) {
+    console.error('Password change error:', error);
+    res.status(400).json({
+      success: false,
+      message: error.message || 'Password change failed',
+    });
+  }
+});
+
+/**
+ * Request password reset
+ * POST /api/auth/forgot-password
+ */
+router.post('/forgot-password', async (req: Request, res: Response) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email is required',
+      });
+    }
+
+    const resetToken = await authService.requestPasswordReset(email);
+
+    // In production, send email with reset link
+    // For now, return token in response (development only)
+    res.json({
+      success: true,
+      message: 'Password reset instructions sent to email',
+      // Remove this in production:
+      data: { resetToken },
+    });
+  } catch (error: any) {
+    console.error('Password reset request error:', error);
+    res.status(400).json({
+      success: false,
+      message: error.message || 'Password reset request failed',
+    });
+  }
+});
+
+/**
+ * Reset password with token
+ * POST /api/auth/reset-password
+ */
+router.post('/reset-password', async (req: Request, res: Response) => {
+  try {
+    const { token, newPassword } = req.body;
+
+    if (!token || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Token and new password are required',
+      });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'New password must be at least 8 characters long',
+      });
+    }
+
+    await authService.resetPassword(token, newPassword);
+
+    res.json({
+      success: true,
+      message: 'Password reset successfully',
+    });
+  } catch (error: any) {
+    console.error('Password reset error:', error);
+    res.status(400).json({
+      success: false,
+      message: error.message || 'Password reset failed',
+    });
+  }
+});
+
+/**
+ * Logout (client-side token removal)
+ * POST /api/auth/logout
+ */
+router.post('/logout', async (req: Request, res: Response) => {
+  // JWT tokens are stateless, so logout is handled client-side
+  // This endpoint is here for consistency and future token blacklisting
+  res.json({
+    success: true,
+    message: 'Logged out successfully',
+  });
+});
 
 export default router;
