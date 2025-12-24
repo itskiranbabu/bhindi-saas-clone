@@ -1,209 +1,287 @@
-import { Router, Response } from 'express';
-import { body, validationResult } from 'express-validator';
-import { query, transaction } from '../database/connection';
-import { AuthRequest } from '../middleware/auth.middleware';
-import { AppError, asyncHandler } from '../middleware/error.middleware';
-import { aiRateLimiter } from '../middleware/rateLimit.middleware';
+import { Router, Request, Response } from 'express';
+import { conversationService } from '../services/conversation.service';
+import { authService } from '../services/auth.service';
 
 const router = Router();
 
-// Get all conversations
-router.get(
-  '/',
-  asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { workspaceId } = req.query;
+// Middleware to verify authentication
+const authenticate = async (req: any, res: Response, next: any) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
 
-    let queryText = `
-      SELECT c.id, c.title, c.status, c.created_at, c.updated_at,
-             COUNT(m.id) as message_count
-      FROM conversations c
-      LEFT JOIN messages m ON c.id = m.conversation_id
-      WHERE c.user_id = $1 AND c.archived_at IS NULL
-    `;
-    const params: any[] = [req.user!.id];
-
-    if (workspaceId) {
-      queryText += ` AND c.workspace_id = $2`;
-      params.push(workspaceId);
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
     }
 
-    queryText += `
-      GROUP BY c.id
-      ORDER BY c.updated_at DESC
-      LIMIT 50
-    `;
-
-    const result = await query(queryText, params);
-
-    res.json({
-      success: true,
-      data: { conversations: result.rows },
+    const user = await authService.verifyToken(token);
+    req.user = user;
+    next();
+  } catch (error: any) {
+    res.status(401).json({
+      success: false,
+      message: error.message || 'Invalid token',
     });
-  })
-);
+  }
+};
 
-// Get conversation by ID
-router.get(
-  '/:conversationId',
-  asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { conversationId } = req.params;
+/**
+ * Get all conversations
+ * GET /api/conversations
+ */
+router.get('/', authenticate, async (req: any, res: Response) => {
+  try {
+    const { workspaceId, limit } = req.query;
 
-    const convResult = await query(
-      `SELECT c.id, c.title, c.context, c.metadata, c.status, c.created_at, c.updated_at
-       FROM conversations c
-       WHERE c.id = $1 AND c.user_id = $2 AND c.archived_at IS NULL`,
-      [conversationId, req.user!.id]
-    );
-
-    if (convResult.rows.length === 0) {
-      throw new AppError('Conversation not found', 404);
-    }
-
-    const conversation = convResult.rows[0];
-
-    // Get messages
-    const messagesResult = await query(
-      `SELECT id, role, content, tokens_used, model_used, metadata, created_at
-       FROM messages
-       WHERE conversation_id = $1
-       ORDER BY created_at ASC`,
-      [conversationId]
+    const conversations = await conversationService.getConversations(
+      req.user.id,
+      workspaceId as string,
+      limit ? parseInt(limit as string) : 50
     );
 
     res.json({
       success: true,
-      data: {
-        conversation,
-        messages: messagesResult.rows,
-      },
+      data: conversations,
     });
-  })
-);
+  } catch (error: any) {
+    console.error('Get conversations error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to get conversations',
+    });
+  }
+});
 
-// Create new conversation
-router.post(
-  '/',
-  [body('title').optional().trim(), body('workspaceId').isUUID()],
-  asyncHandler(async (req: AuthRequest, res: Response) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      throw new AppError('Validation failed', 400);
+/**
+ * Get conversation by ID
+ * GET /api/conversations/:id
+ */
+router.get('/:id', authenticate, async (req: any, res: Response) => {
+  try {
+    const conversation = await conversationService.getConversation(
+      req.params.id,
+      req.user.id
+    );
+
+    res.json({
+      success: true,
+      data: conversation,
+    });
+  } catch (error: any) {
+    console.error('Get conversation error:', error);
+    res.status(404).json({
+      success: false,
+      message: error.message || 'Conversation not found',
+    });
+  }
+});
+
+/**
+ * Create new conversation
+ * POST /api/conversations
+ */
+router.post('/', authenticate, async (req: any, res: Response) => {
+  try {
+    const { workspaceId, title } = req.body;
+
+    if (!workspaceId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Workspace ID is required',
+      });
     }
 
-    const { title, workspaceId } = req.body;
-
-    const result = await query(
-      `INSERT INTO conversations (workspace_id, user_id, title, status)
-       VALUES ($1, $2, $3, 'active')
-       RETURNING id, title, status, created_at`,
-      [workspaceId, req.user!.id, title || 'New Conversation']
+    const conversation = await conversationService.createConversation(
+      req.user.id,
+      workspaceId,
+      title
     );
 
     res.status(201).json({
       success: true,
-      data: { conversation: result.rows[0] },
+      message: 'Conversation created successfully',
+      data: conversation,
     });
-  })
-);
+  } catch (error: any) {
+    console.error('Create conversation error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to create conversation',
+    });
+  }
+});
 
-// Send message
-router.post(
-  '/:conversationId/messages',
-  aiRateLimiter,
-  [body('content').trim().notEmpty()],
-  asyncHandler(async (req: AuthRequest, res: Response) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      throw new AppError('Validation failed', 400);
+/**
+ * Send message to conversation
+ * POST /api/conversations/:id/messages
+ */
+router.post('/:id/messages', authenticate, async (req: any, res: Response) => {
+  try {
+    const { content, model } = req.body;
+
+    if (!content) {
+      return res.status(400).json({
+        success: false,
+        message: 'Message content is required',
+      });
     }
 
-    const { conversationId } = req.params;
-    const { content } = req.body;
-
-    // Verify conversation ownership
-    const convCheck = await query(
-      'SELECT id FROM conversations WHERE id = $1 AND user_id = $2',
-      [conversationId, req.user!.id]
+    const result = await conversationService.sendMessage(
+      req.params.id,
+      req.user.id,
+      content,
+      model
     );
 
-    if (convCheck.rows.length === 0) {
-      throw new AppError('Conversation not found', 404);
-    }
-
-    await transaction(async (client) => {
-      // Save user message
-      await client.query(
-        `INSERT INTO messages (conversation_id, role, content)
-         VALUES ($1, 'user', $2)`,
-        [conversationId, content]
-      );
-
-      // Update conversation timestamp
-      await client.query(
-        'UPDATE conversations SET updated_at = NOW() WHERE id = $1',
-        [conversationId]
-      );
-    });
-
-    // TODO: Call AI engine to generate response
-    // For now, return success
     res.json({
       success: true,
-      message: 'Message sent successfully',
+      data: result,
     });
-  })
-);
+  } catch (error: any) {
+    console.error('Send message error:', error);
+    
+    // Handle quota exceeded errors
+    if (error.message.includes('quota exceeded')) {
+      return res.status(429).json({
+        success: false,
+        message: error.message,
+      });
+    }
 
-// Update conversation
-router.patch(
-  '/:conversationId',
-  [body('title').optional().trim()],
-  asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { conversationId } = req.params;
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to send message',
+    });
+  }
+});
+
+/**
+ * Stream message response (SSE)
+ * POST /api/conversations/:id/messages/stream
+ */
+router.post('/:id/messages/stream', authenticate, async (req: any, res: Response) => {
+  try {
+    const { content, model } = req.body;
+
+    if (!content) {
+      return res.status(400).json({
+        success: false,
+        message: 'Message content is required',
+      });
+    }
+
+    // Set up SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    // Stream the response
+    const stream = conversationService.streamMessage(
+      req.params.id,
+      req.user.id,
+      content,
+      model
+    );
+
+    for await (const chunk of stream) {
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    }
+
+    res.end();
+  } catch (error: any) {
+    console.error('Stream message error:', error);
+    
+    // Send error as SSE event
+    res.write(`data: ${JSON.stringify({
+      type: 'error',
+      message: error.message || 'Failed to stream message',
+    })}\n\n`);
+    res.end();
+  }
+});
+
+/**
+ * Update conversation title
+ * PATCH /api/conversations/:id
+ */
+router.patch('/:id', authenticate, async (req: any, res: Response) => {
+  try {
     const { title } = req.body;
 
-    const result = await query(
-      `UPDATE conversations
-       SET title = COALESCE($1, title), updated_at = NOW()
-       WHERE id = $2 AND user_id = $3
-       RETURNING id, title, updated_at`,
-      [title, conversationId, req.user!.id]
-    );
-
-    if (result.rows.length === 0) {
-      throw new AppError('Conversation not found', 404);
+    if (!title) {
+      return res.status(400).json({
+        success: false,
+        message: 'Title is required',
+      });
     }
+
+    await conversationService.updateTitle(
+      req.params.id,
+      req.user.id,
+      title
+    );
 
     res.json({
       success: true,
-      data: { conversation: result.rows[0] },
+      message: 'Conversation updated successfully',
     });
-  })
-);
+  } catch (error: any) {
+    console.error('Update conversation error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to update conversation',
+    });
+  }
+});
 
-// Archive conversation
-router.delete(
-  '/:conversationId',
-  asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { conversationId } = req.params;
-
-    const result = await query(
-      `UPDATE conversations
-       SET archived_at = NOW()
-       WHERE id = $1 AND user_id = $2
-       RETURNING id`,
-      [conversationId, req.user!.id]
+/**
+ * Archive conversation
+ * DELETE /api/conversations/:id
+ */
+router.delete('/:id', authenticate, async (req: any, res: Response) => {
+  try {
+    await conversationService.archiveConversation(
+      req.params.id,
+      req.user.id
     );
-
-    if (result.rows.length === 0) {
-      throw new AppError('Conversation not found', 404);
-    }
 
     res.json({
       success: true,
-      message: 'Conversation archived',
+      message: 'Conversation archived successfully',
     });
-  })
-);
+  } catch (error: any) {
+    console.error('Archive conversation error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to archive conversation',
+    });
+  }
+});
+
+/**
+ * Permanently delete conversation
+ * DELETE /api/conversations/:id/permanent
+ */
+router.delete('/:id/permanent', authenticate, async (req: any, res: Response) => {
+  try {
+    await conversationService.deleteConversation(
+      req.params.id,
+      req.user.id
+    );
+
+    res.json({
+      success: true,
+      message: 'Conversation deleted permanently',
+    });
+  } catch (error: any) {
+    console.error('Delete conversation error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to delete conversation',
+    });
+  }
+});
 
 export default router;
